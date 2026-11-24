@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
-import type { ConnectionStatus, ConnectionType } from '@/types'
+import { onMounted, onUnmounted, ref, watch } from 'vue'
+import type { ConnectionStatus, ConnectionType, ExportSettings } from '@/types'
 import { CONNECTION_TYPE_OPTIONS, BAUD_RATES } from '@/types'
+import ExportSettingsPopover from './ExportSettingsPopover.vue'
 
 const props = defineProps<{
   status: ConnectionStatus
@@ -12,22 +13,55 @@ const props = defineProps<{
   btCharacteristicUUID: string
   baudRate: number
   isDark: boolean
+  isRunning: boolean
+  exportSettings: ExportSettings
+  hasData: boolean
   hasConnectedBefore?: boolean
 }>()
 
 const emit = defineEmits<{
   connect: []
   'connect:forceSelect': []
-  clear: []
+  toggleRunning: []
   export: []
   import: []
   toggleTheme: []
+  'update:exportSettings': [value: ExportSettings]
   'update:connectionType': [value: ConnectionType]
   'update:wsUrl': [value: string]
   'update:btServiceUUID': [value: string]
   'update:btCharacteristicUUID': [value: string]
   'update:baudRate': [value: number]
 }>()
+
+const exportMenuOpen = ref(false)
+const exportWrapper = ref<HTMLElement | null>(null)
+
+const handleExportClick = () => {
+  if (!props.hasData) return
+  exportMenuOpen.value = false
+  emit('export')
+}
+
+const handlePopoverExport = () => {
+  exportMenuOpen.value = false
+  emit('export')
+}
+
+const handleDocumentMouseDown = (event: MouseEvent) => {
+  if (!exportMenuOpen.value) return
+  if (exportWrapper.value && !exportWrapper.value.contains(event.target as Node)) {
+    exportMenuOpen.value = false
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('mousedown', handleDocumentMouseDown)
+})
+
+onUnmounted(() => {
+  document.removeEventListener('mousedown', handleDocumentMouseDown)
+})
 
 const localWsUrl = ref(props.wsUrl)
 const localBtServiceUUID = ref(props.btServiceUUID)
@@ -106,20 +140,54 @@ const statusColor = {
         导入
       </button>
 
-      <!-- 导出 -->
-      <button
-        :class="['px-3 py-1.5 text-sm rounded', isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white hover:bg-gray-200 text-gray-700']"
-        @click="emit('export')"
-      >
-        导出
-      </button>
+      <!-- 导出 + 导出设置 -->
+      <div ref="exportWrapper" class="relative flex items-center gap-1">
+        <button
+          :class="['px-3 py-1.5 text-sm rounded', hasData
+            ? (isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white hover:bg-gray-200 text-gray-700')
+            : (isDark ? 'bg-gray-800 text-gray-600 cursor-not-allowed' : 'bg-gray-100 text-gray-400 cursor-not-allowed')]"
+          :disabled="!hasData"
+          :title="hasData ? '按当前导出设置导出数据' : '暂无数据可导出'"
+          @click="handleExportClick"
+        >
+          导出
+        </button>
+        <button
+          :class="['p-1.5 text-sm rounded', isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white hover:bg-gray-200 text-gray-700', exportMenuOpen ? (isDark ? 'ring-1 ring-blue-500' : 'ring-1 ring-blue-600') : '']"
+          title="导出设置（名称、格式等）"
+          :aria-expanded="exportMenuOpen"
+          @click="exportMenuOpen = !exportMenuOpen"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.5 6h9.75M10.5 6a1.5 1.5 0 11-3 0m3 0a1.5 1.5 0 10-3 0M3.75 6H7.5m3 12h9.75m-9.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-3.75 0H7.5m9-6h3.75m-3.75 0a1.5 1.5 0 01-3 0m3 0a1.5 1.5 0 00-3 0m-9.75 0h9.75" />
+          </svg>
+        </button>
 
-      <!-- 清除 -->
+        <ExportSettingsPopover
+          v-if="exportMenuOpen"
+          :settings="exportSettings"
+          :has-data="hasData"
+          :is-dark="isDark"
+          @update:settings="emit('update:exportSettings', $event)"
+          @export="handlePopoverExport"
+          @close="exportMenuOpen = false"
+        />
+      </div>
+
+      <!-- 开始 / 停止 -->
       <button
-        :class="['px-3 py-1.5 text-sm rounded', isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-white hover:bg-gray-200 text-gray-700']"
-        @click="emit('clear')"
+        :class="['px-3 py-1.5 text-sm rounded text-white flex items-center gap-1.5', isRunning ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700']"
+        :title="isRunning ? '停止接收数据（保留当前波形）' : '开始接收数据（会先清除当前数据）'"
+        @click="emit('toggleRunning')"
       >
-        清除
+        <svg v-if="isRunning" class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+          <rect x="6" y="5" width="4" height="14" rx="1" />
+          <rect x="14" y="5" width="4" height="14" rx="1" />
+        </svg>
+        <svg v-else class="w-3.5 h-3.5" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M7 4.5v15a1 1 0 001.54.84l12-7.5a1 1 0 000-1.68l-12-7.5A1 1 0 007 4.5z" />
+        </svg>
+        {{ isRunning ? '停止' : '开始' }}
       </button>
 
       <!-- 主题切换按钮 -->

@@ -13,12 +13,16 @@ An 8-channel Web oscilloscope with real-time 100 kHz waveform refresh, designed 
 - 支持协议动态切换（JustFloat/FireWater）
 - 支持连接方式切换（串口/WebSocket）
 - 实时绘制多通道波形图（最多支持8种颜色区分通道）
-- 支持数据导入/导出功能（JSON格式）
+- 支持数据导入/导出功能（JSON / CSV），导出名称、格式、小数位等设置自动保存
+- 采集开始/停止控制：停止时冻结波形，开始时自动清空旧数据
+- 通道波形分析：正弦波（基频、直流分量、交流幅值/RMS、THD、频谱、拟合 R²）、方波（高/低电平、正负占空比、频率、边沿抖动、重建 R²）、稳定值（均值、中位数、标准差、置信区间、漂移、分布）
 - 通道配置：可独立设置每个通道的名称、单位、系数和可见性
 - 实时显示通道统计数据（最小值、最大值、平均值、当前值）
 - 可配置的缓冲区大小（最小1000点，最大1000000点）
 - 支持多种波特率（默认115200）
 - 性能优化：JustFloat模式下 1个通道 100KHz 运行流畅！
+- 采样率采用累计平均估算，能抵抗突发数据批次；大块数据不会被截断或丢帧
+- 采样率支持自动估算 / 手动锁定，手动值用于基频、时长、选区统计和导出时间列
 
 ## 连接方式
 
@@ -119,6 +123,7 @@ An 8-channel Web oscilloscope with real-time 100 kHz waveform refresh, designed 
 5. 根据需要调整波特率设置（串口连接时有效）
 6. 实时查看设备发送的数据波形
 7. 使用鼠标框选功能进行数据区域分析
+8. 点击通道右侧的波形图标（或展开通道后点击“波形分析”），选择正弦波 / 方波 / 稳定值类型查看参数与图表
 
 ## 功能操作
 
@@ -127,10 +132,14 @@ An 8-channel Web oscilloscope with real-time 100 kHz waveform refresh, designed 
   - 连续框选会自动记录每次缩放的状态
   - 缩放状态指示器会显示当前历史记录的级数
   - 当没有历史记录时，双击会完全重置缩放
-- **数据统计**：选区后会显示详细的统计数据（采样点数、时长、速率等）
+- **数据统计**：选区后会显示采样点数、时长、采样率、范围及各通道主频（FFT 估算）
 - **通道控制**：可以在侧边栏单独控制每个通道的显示/隐藏
 - **实时光标**：移动鼠标可以查看任意点的具体数值
-- **数据导出**：可将当前显示的数据导出为JSON文件（按通道存储，包含采样率信息）
+- **波形分析**：按通道选择波形类型后进行分析，以分页弹窗展示参数、拟合曲线、频谱 / 分布图和明细表
+- **开始 / 停止**：停止采集时保留当前波形，便于分析；再次开始时自动清空缓冲区
+- **数据导出**：点击“导出”按当前设置下载数据；点击旁边的设置按钮可修改文件名称、格式（JSON / CSV）、小数位、时间列等，修改后自动保存
+  - JSON：保留原始采样值与通道配置，可重新导入本应用
+  - CSV：应用通道系数并输出时间列，便于 Excel / Python 分析
 - **连接切换**：可在串口和WebSocket之间切换连接方式
 
 ## 项目结构
@@ -138,11 +147,15 @@ An 8-channel Web oscilloscope with real-time 100 kHz waveform refresh, designed 
 ```
 src/
 ├── components/          # Vue组件
-│   ├── HeaderBar.vue    # 顶部导航栏（含连接方式选择）
+│   ├── HeaderBar.vue    # 顶部导航栏（含连接方式选择、导出设置、开始/停止）
 │   ├── SidePanel.vue    # 侧边面板（含协议选择）
 │   ├── OscilloscopeChart.vue # 示波器图表
 │   ├── StatusBar.vue    # 状态栏
-│   └── ChannelItem.vue  # 通道配置项
+│   ├── ChannelItem.vue  # 通道配置项（含波形分析入口）
+│   ├── ExportSettingsPopover.vue # 导出设置弹框
+│   ├── ChannelAnalysisModal.vue  # 波形分析弹窗（正弦/方波/稳定值分页）
+│   ├── AnalysisChart.vue         # 分析图表（uPlot 封装）
+│   └── analysis/                 # 各波形分析视图与统计卡片
 ├── composables/         # Vue组合式API函数
 │   ├── useSerial.ts     # 串口通信
 │   ├── useWebSocket.ts  # WebSocket通信
@@ -151,5 +164,9 @@ src/
 │   ├── useChannelConfig.ts # 通道配置
 │   └── useStorage.ts    # 数据存储
 ├── types/index.ts       # 类型定义
-└── utils/helpers.ts     # 工具函数
+└── utils/
+    ├── helpers.ts       # 工具函数（格式化、CSV、下载）
+    ├── signalAnalysis.ts # 波形分析算法（FFT、拟合、占空比、统计）
+    ├── sampleRateTracker.ts # 抗突发数据的采样率估算
+    └── analysisTheme.ts # 分析图表配色
 ```

@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import type { ChannelConfig, ChannelStats, ProtocolType } from '@/types'
 import { MIN_BUFFER_SIZE, MAX_BUFFER_SIZE, PROTOCOL_OPTIONS } from '@/types'
+import { formatFrequency } from '@/utils/helpers'
 import ChannelItem from './ChannelItem.vue'
 
 const props = defineProps<{
@@ -12,6 +13,8 @@ const props = defineProps<{
   cursorValues: number[] | null
   cursorIndex: number | null
   getChannelStats: (channelIndex: number) => ChannelStats | null
+  sampleRateOverride: number | null
+  effectiveSampleRate: number
   isDark: boolean
 }>()
 
@@ -20,6 +23,8 @@ const emit = defineEmits<{
   'update:protocol': [value: ProtocolType]
   'updateChannel': [id: number, updates: Partial<ChannelConfig>]
   'toggleVisibility': [id: number]
+  'analyzeChannel': [id: number]
+  'update:sampleRateOverride': [value: number | null]
 }>()
 
 // 本地状态（防止输入时被外部值覆盖）
@@ -39,6 +44,40 @@ const commitBufferSize = () => {
   const value = Math.max(MIN_BUFFER_SIZE, Math.min(MAX_BUFFER_SIZE, localBufferSize.value))
   localBufferSize.value = value
   emit('update:bufferSize', value)
+}
+
+// 采样率手动锁定
+const localSampleRate = ref(
+  props.sampleRateOverride ?? (props.effectiveSampleRate > 0 ? props.effectiveSampleRate : 1000)
+)
+
+watch(() => props.sampleRateOverride, (value) => {
+  if (value != null) localSampleRate.value = value
+})
+
+watch(() => props.effectiveSampleRate, (value) => {
+  if (props.sampleRateOverride == null && value > 0) {
+    localSampleRate.value = value
+  }
+})
+
+const handleAutoRateChange = (event: Event) => {
+  const auto = (event.target as HTMLInputElement).checked
+  if (auto) {
+    emit('update:sampleRateOverride', null)
+  } else {
+    const current = props.effectiveSampleRate > 0 ? props.effectiveSampleRate : localSampleRate.value
+    const value = current > 0 ? current : 1000
+    localSampleRate.value = value
+    emit('update:sampleRateOverride', value)
+  }
+}
+
+const commitSampleRate = () => {
+  const parsed = Number(localSampleRate.value)
+  const value = Number.isFinite(parsed) && parsed > 0 ? parsed : 1000
+  localSampleRate.value = value
+  emit('update:sampleRateOverride', value)
 }
 
 // 显示的通道数量
@@ -95,6 +134,38 @@ const getCursorValue = (channelId: number): number | null => {
           @keydown.enter="($event.target as HTMLInputElement).blur()"
         />
       </div>
+
+      <!-- 采样率 -->
+      <div class="mt-3">
+        <div class="flex items-center justify-between mb-1">
+          <label :class="['block text-xs', isDark ? 'text-gray-500' : 'text-gray-600']">采样率 (Hz)</label>
+          <label :class="['flex items-center gap-1 text-xs cursor-pointer', isDark ? 'text-gray-400' : 'text-gray-600']">
+            <input
+              type="checkbox"
+              :checked="sampleRateOverride == null"
+              class="accent-blue-600"
+              @change="handleAutoRateChange"
+            />
+            自动
+          </label>
+        </div>
+        <input
+          v-if="sampleRateOverride != null"
+          type="number"
+          v-model.number="localSampleRate"
+          min="1"
+          step="1"
+          :class="['w-full rounded px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500', isDark ? 'bg-gray-700 border border-gray-600 text-white' : 'bg-white border border-gray-400 text-gray-900']"
+          @blur="commitSampleRate"
+          @keydown.enter="($event.target as HTMLInputElement).blur()"
+        />
+        <div v-else :class="['text-sm font-mono', isDark ? 'text-gray-300' : 'text-gray-800']">
+          {{ effectiveSampleRate > 0 ? formatFrequency(effectiveSampleRate) : '等待数据...' }}
+        </div>
+        <div :class="['text-[10px] mt-1', isDark ? 'text-gray-600' : 'text-gray-500']">
+          锁定后用于基频、时长和导出时间列
+        </div>
+      </div>
     </div>
 
     <!-- 通道列表 -->
@@ -118,6 +189,7 @@ const getCursorValue = (channelId: number): number | null => {
           :is-dark="isDark"
           @update="(updates) => emit('updateChannel', channel.id, updates)"
           @toggle-visibility="emit('toggleVisibility', channel.id)"
+          @analyze="emit('analyzeChannel', channel.id)"
         />
       </div>
     </div>

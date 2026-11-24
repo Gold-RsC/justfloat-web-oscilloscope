@@ -8,7 +8,10 @@ export function useProtocolParser() {
   const currentProtocol = ref<ProtocolType>('justfloat')
 
   // JustFloat 内部状态
-  let justfloatBuffer: number[] = []
+  const INITIAL_JUSTFLOAT_CAPACITY = 8192
+  const MAX_JUSTFLOAT_RESIDUAL = 4 * 1024 * 1024
+  let justfloatBuffer = new Uint8Array(INITIAL_JUSTFLOAT_CAPACITY)
+  let justfloatLength = 0
   let expectedChannelCount = 0 // 记录预期的通道数，用于检测异常
 
   // FireWater 内部状态
@@ -129,30 +132,37 @@ export function useProtocolParser() {
     return true
   }
 
-  const parseFloats = (data: number[]): number[] => {
-    const floats: number[] = []
-    const dataView = new DataView(new ArrayBuffer(4))
+  const ensureJustfloatCapacity = (required: number) => {
+    if (required <= justfloatBuffer.length) return
+    let capacity = justfloatBuffer.length
+    while (capacity < required) capacity *= 2
+    const next = new Uint8Array(capacity)
+    next.set(justfloatBuffer.subarray(0, justfloatLength))
+    justfloatBuffer = next
+  }
 
-    for (let i = 0; i < data.length; i += 4) {
-      dataView.setUint8(0, data[i])
-      dataView.setUint8(1, data[i + 1])
-      dataView.setUint8(2, data[i + 2])
-      dataView.setUint8(3, data[i + 3])
-      floats.push(dataView.getFloat32(0, true))
+  // 直接在缓冲区上读取 little-endian float32，避免逐字节复制
+  const parseFloats = (payloadStart: number, payloadEnd: number): number[] => {
+    const count = (payloadEnd - payloadStart) >> 2
+    const view = new DataView(
+      justfloatBuffer.buffer,
+      justfloatBuffer.byteOffset + payloadStart,
+      count * 4
+    )
+    const floats = new Array<number>(count)
+    for (let i = 0; i < count; i++) {
+      floats[i] = view.getFloat32(i * 4, true)
     }
-
     return floats
   }
 
-  // 快速查找同步字节位置（使用 Uint8Array 的 indexOf 批量搜索）
-  const findSyncBytes = (data: Uint8Array, startIndex: number): number => {
-    // 查找 0x00 0x00 0x80 0x7F 模式
-    // 优化：先找 0x7F，然后回退检查前面三个字节
-    for (let i = startIndex + 3; i < data.length; i++) {
-      if (data[i] === SYNC_BYTES[3] &&
-          data[i - 1] === SYNC_BYTES[2] &&
-          data[i - 2] === SYNC_BYTES[1] &&
-          data[i - 3] === SYNC_BYTES[0]) {
+  // 在当前缓冲区中查找同步字，返回同步字起始位置
+  const findSyncBytes = (startIndex: number, endIndex: number): number => {
+    for (let i = startIndex + 3; i < endIndex; i++) {
+      if (justfloatBuffer[i] === SYNC_BYTES[3] &&
+          justfloatBuffer[i - 1] === SYNC_BYTES[2] &&
+          justfloatBuffer[i - 2] === SYNC_BYTES[1] &&
+          justfloatBuffer[i - 3] === SYNC_BYTES[0]) {
         return i - 3
       }
     }
@@ -160,65 +170,57 @@ export function useProtocolParser() {
   }
 
   const processJustFloat = (data: Uint8Array) => {
-    // 将新数据追加到 buffer（使用 Uint8Array 提高性能）
-    const newBuffer = new Uint8Array(justfloatBuffer.length + data.length)
-    newBuffer.set(justfloatBuffer)
-    newBuffer.set(data, justfloatBuffer.length)
-    justfloatBuffer = Array.from(newBuffer)
+    if (data.length === 0) return
 
-    // 限制 buffer 大小（避免内存溢出）
-    if (justfloatBuffer.length > 50000) {
-      // 保留最后一部分数据，但要对齐到4字节边界
-      const excess = justfloatBuffer.length - 4096
-      const alignedExcess = Math.floor(excess / 4) * 4
-      justfloatBuffer = justfloatBuffer.slice(alignedExcess)
-    }
+    // 追加到连续缓冲区；大数据块也能完整解析，不会在解析前被截断
+    ensureJustfloatCapacity(justfloatLength + data.length)
+    justfloatBuffer.set(data, justfloatLength)
+    justfloatLength += data.length
 
-    // 批量处理：查找所有同步字节位置
+    let previousSync = -1
+    let lastCompleteSync = -1
     let searchStart = 0
-    const syncPositions: number[] = []
 
-    while (searchStart < justfloatBuffer.length - 3) {
-      const pos = findSyncBytes(new Uint8Array(justfloatBuffer), searchStart)
-      if (pos === -1) break
-      syncPositions.push(pos)
-      searchStart = pos + 4 // 跳到同步字之后继续搜索
-    }
+    while (searchStart < justfloatLength - 3) {
+      const sync = findSyncBytes(searchStart, justfloatLength)
+      if (sync < 0) break
 
-    // 如果没有找到同步字，直接返回
-    if (syncPositions.length === 0) return
+      if (previousSync >= 0) {
+        const payloadStart = previousSync + 4
+        const payloadEnd = sync
 
-    // 处理帧（需要至少两个同步字才能确定一帧）
-    let processedUpTo = 0
-    for (let i = 0; i < syncPositions.length - 1; i++) {
-      const firstSync = syncPositions[i]
-      const secondSync = syncPositions[i + 1]
-      const payloadStart = firstSync + 4
-      const payloadEnd = secondSync
-
-      if (!isValidPayload(payloadStart, payloadEnd)) continue
-
-      const payload = justfloatBuffer.slice(payloadStart, payloadEnd)
-      const values = parseFloats(payload)
-
-      // 检查通道数一致性
-      if (expectedChannelCount > 0 && values.length !== expectedChannelCount) {
-        continue
-      }
-
-      if (values.length > 0) {
-        if (expectedChannelCount === 0) {
-          expectedChannelCount = values.length
+        if (isValidPayload(payloadStart, payloadEnd)) {
+          const values = parseFloats(payloadStart, payloadEnd)
+          if (values.length > 0 && (expectedChannelCount === 0 || values.length === expectedChannelCount)) {
+            if (expectedChannelCount === 0) {
+              expectedChannelCount = values.length
+            }
+            addFrameToBatch(values)
+            lastCompleteSync = sync
+          }
         }
-        addFrameToBatch(values)
       }
 
-      processedUpTo = secondSync
+      previousSync = sync
+      searchStart = sync + 4
     }
 
-    // 保留未处理的数据（从最后一个完整的帧开始）
-    if (processedUpTo > 0) {
-      justfloatBuffer = justfloatBuffer.slice(processedUpTo)
+    // 只保留最后一个完整帧的同步字及之后的数据
+    if (lastCompleteSync >= 0) {
+      const remaining = justfloatLength - lastCompleteSync
+      if (remaining > 0) {
+        justfloatBuffer.copyWithin(0, lastCompleteSync, justfloatLength)
+      }
+      justfloatLength = remaining
+    }
+
+    // 仅在残留大量无法解析的数据时限制内存（已完成解析的数据不受影响）
+    if (justfloatLength > MAX_JUSTFLOAT_RESIDUAL) {
+      const keep = 4096
+      const drop = justfloatLength - keep
+      const alignedDrop = Math.floor(drop / 4) * 4
+      justfloatBuffer.copyWithin(0, alignedDrop, justfloatLength)
+      justfloatLength -= alignedDrop
     }
   }
 
@@ -226,43 +228,25 @@ export function useProtocolParser() {
   // 格式: "<any>:ch0,ch1,ch2,...,chN\n" 或 "ch0,ch1,...,chN\n"
 
   const processFireWater = (data: Uint8Array) => {
-    // 将新数据追加到缓冲区
-    firewaterBuffer += textDecoder.decode(data, { stream: true })
+    // 将新数据追加到缓冲区，先处理所有完整行，再限制未完成行的长度
+    const text = firewaterBuffer + textDecoder.decode(data, { stream: true })
+    const lines = text.split(/\r\n|\n\r|\r|\n/)
+    firewaterBuffer = lines.pop() ?? ''
 
-    // 防止缓冲区过大
-    if (firewaterBuffer.length > 100000) {
-      firewaterBuffer = firewaterBuffer.slice(-50000)
-    }
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
 
-    // 查找并处理完整的行
-    let lineEnd: number
-    while ((lineEnd = findLineEnd(firewaterBuffer)) !== -1) {
-      const line = firewaterBuffer.substring(0, lineEnd).trim()
-      firewaterBuffer = firewaterBuffer.substring(lineEnd + 1)
-
-      // 跳过空行
-      if (!line) continue
-
-      // 解析行数据
-      const values = parseFireWaterLine(line)
+      const values = parseFireWaterLine(trimmed)
       if (values && values.length > 0) {
         addFrameToBatch(values)
       }
     }
-  }
 
-  // 查找行结束位置（支持 \n, \r\n, \n\r）
-  const findLineEnd = (str: string): number => {
-    for (let i = 0; i < str.length; i++) {
-      if (str[i] === '\n' || str[i] === '\r') {
-        // 跳过可能的 \r\n 或 \n\r 组合
-        if (i + 1 < str.length && (str[i + 1] === '\n' || str[i + 1] === '\r') && str[i + 1] !== str[i]) {
-          return i + 1
-        }
-        return i
-      }
+    // 仅限制未完成行的长度，避免异常数据导致内存增长
+    if (firewaterBuffer.length > 100000) {
+      firewaterBuffer = firewaterBuffer.slice(-50000)
     }
-    return -1
   }
 
   // 解析 FireWater 行格式
@@ -333,7 +317,10 @@ export function useProtocolParser() {
     }
     framesBatch = []
     // JustFloat 状态
-    justfloatBuffer = []
+    justfloatLength = 0
+    if (justfloatBuffer.length > 1024 * 1024) {
+      justfloatBuffer = new Uint8Array(INITIAL_JUSTFLOAT_CAPACITY)
+    }
     expectedChannelCount = 0 // 重置通道数记录
     // FireWater 状态
     firewaterBuffer = ''

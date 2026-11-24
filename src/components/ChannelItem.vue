@@ -15,6 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   update: [updates: Partial<ChannelConfig>]
   toggleVisibility: []
+  analyze: []
 }>()
 
 const isExpanded = ref(false)
@@ -125,7 +126,7 @@ const selectColor = (color: string) => {
       <!-- 通道名称 -->
       <span :class="['flex-1 text-sm truncate', isDark ? 'text-white' : 'text-gray-900']">
         {{ channel.name }}
-        <span v-if="channel.unit" :class="['text-xs ml-1', isDark ? 'text-gray-400' : 'text-gray-600']">({{ channel.unit }})</span>
+        <span v-if="channel.unit && !stats" :class="['text-xs ml-1', isDark ? 'text-gray-400' : 'text-gray-600']">({{ channel.unit }})</span>
       </span>
 
       <!-- 当前值 -->
@@ -133,6 +134,21 @@ const selectColor = (color: string) => {
         {{ formatNumber(stats.current, 3) }}
         <span v-if="channel.unit" :class="['text-xs', isDark ? 'text-gray-500' : 'text-gray-600']">{{ channel.unit }}</span>
       </span>
+
+      <!-- 波形分析 -->
+      <button
+        class="p-1 rounded"
+        :class="stats
+          ? ['text-cyan-400', isDark ? 'hover:bg-gray-600' : 'hover:bg-gray-300']
+          : ['text-gray-500', 'opacity-40 cursor-not-allowed']"
+        :disabled="!stats"
+        @click.stop="stats && emit('analyze')"
+        title="波形分析"
+      >
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12h3l2.5-7 4 14L15 12h6" />
+        </svg>
+      </button>
 
       <!-- 可见性开关 -->
       <button
@@ -284,9 +300,17 @@ const selectColor = (color: string) => {
       </div>
 
       <!-- 快速操作 -->
-      <div class="flex gap-2 pt-2">
+      <div class="grid grid-cols-3 gap-2 pt-2">
         <button
-          class="flex-1 px-2 py-1 text-xs rounded text-white"
+          class="px-2 py-1 text-xs rounded text-white"
+          :class="stats ? 'bg-cyan-600 hover:bg-cyan-500' : 'bg-gray-500 opacity-50 cursor-not-allowed'"
+          :disabled="!stats"
+          @click="emit('analyze')"
+        >
+          波形分析
+        </button>
+        <button
+          class="px-2 py-1 text-xs rounded text-white"
           :class="channel.visible
             ? isDark ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-500 hover:bg-gray-600'
             : 'bg-blue-600 hover:bg-blue-500'"

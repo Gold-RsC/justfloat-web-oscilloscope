@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import type { ChannelConfig, SelectionStats } from '@/types'
 import { CHANNEL_COLORS } from '@/types'
-import { formatNumber, formatTime } from '@/utils/helpers'
+import { formatFrequency, formatNumber, formatTime } from '@/utils/helpers'
 
 defineProps<{
   stats: SelectionStats
@@ -104,8 +104,8 @@ const stopDrag = () => {
         <div :class="['font-mono', isDark ? 'text-white' : 'text-gray-900']">{{ formatTime(stats.duration) }}</div>
       </div>
       <div>
-        <span :class="isDark ? 'text-gray-500' : 'text-gray-600'">频率</span>
-        <div :class="['font-mono', isDark ? 'text-white' : 'text-gray-900']">{{ formatNumber(stats.frequency, 0) }}Hz</div>
+        <span :class="isDark ? 'text-gray-500' : 'text-gray-600'">采样率</span>
+        <div :class="['font-mono', isDark ? 'text-white' : 'text-gray-900']">{{ formatFrequency(stats.sampleRate) }}</div>
       </div>
       <div>
         <span :class="isDark ? 'text-gray-500' : 'text-gray-600'">范围</span>
@@ -142,6 +142,15 @@ const stopDrag = () => {
             <div :class="isDark ? 'text-gray-600' : 'text-gray-600'">平均</div>
             <div class="text-blue-500 font-mono">{{ formatNumber(ch.avg) }}</div>
           </div>
+        </div>
+        <div
+          class="mt-1.5 flex items-center justify-between border-t pt-1.5 text-xs"
+          :class="isDark ? 'border-gray-700' : 'border-gray-300'"
+        >
+          <span :class="isDark ? 'text-gray-600' : 'text-gray-600'" title="取选区内最近 8192 点做 FFT 估算">主频</span>
+          <span class="font-mono tabular-nums" :class="isDark ? 'text-gray-300' : 'text-gray-800'">
+            {{ ch.frequency != null ? formatFrequency(ch.frequency) : '—' }}
+          </span>
         </div>
       </div>
     </div>

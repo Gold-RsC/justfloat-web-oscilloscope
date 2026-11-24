@@ -60,6 +60,8 @@ export interface AppConfig {
   wsUrl: string
   btServiceUUID: string
   btCharacteristicUUID: string
+  /** 手动锁定的采样率（Hz）；null 表示自动估算 */
+  sampleRateOverride?: number | null
   isDark?: boolean
   isFirstSerialConnection?: boolean
 }
@@ -70,9 +72,32 @@ export interface DataFrame {
   values: number[]
 }
 
+// 导出格式
+export type ExportFormat = 'json' | 'csv'
+
+// 导出设置（修改后自动保存）
+export interface ExportSettings {
+  fileName: string
+  format: ExportFormat
+  /** JSON 是否包含通道配置 */
+  includeConfig: boolean
+  /** CSV 是否包含时间列 */
+  includeTimeColumn: boolean
+  /** CSV 小数位数 */
+  precision: number
+}
+
+export const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
+  fileName: 'oscilloscope',
+  format: 'json',
+  includeConfig: true,
+  includeTimeColumn: true,
+  precision: 6
+}
+
 // 导出数据格式（按通道存储，不包含时间戳）
 export interface ExportData {
-  config: AppConfig
+  config?: AppConfig
   channels: number[][]  // 二维数组，每个子数组是一个通道的所有数据点
   sampleRate: number
   exportTime: string
@@ -84,12 +109,14 @@ export interface SelectionStats {
   endIndex: number
   pointCount: number
   duration: number
-  frequency: number
+  sampleRate: number
   channels: {
     id: number
     min: number
     max: number
     avg: number
+    /** 该通道在当前选区内的主频估计，无有效周期分量为 null */
+    frequency: number | null
   }[]
 }
 
@@ -103,6 +130,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   wsUrl: 'ws://localhost:8080',
   btServiceUUID: 'ffe0',
   btCharacteristicUUID: 'ffe1',
+  sampleRateOverride: null,
   isDark: true,
   isFirstSerialConnection: true
 }

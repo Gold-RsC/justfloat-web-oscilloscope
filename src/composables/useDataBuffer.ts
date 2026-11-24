@@ -1,6 +1,7 @@
 import { ref, computed, shallowRef } from 'vue'
 import type { DataFrame, ChannelStats } from '@/types'
 import { MIN_BUFFER_SIZE, MAX_BUFFER_SIZE } from '@/types'
+import { SampleRateTracker } from '@/utils/sampleRateTracker'
 
 // 高性能环形缓冲区
 class RingBuffer {
@@ -155,9 +156,56 @@ export function useDataBuffer(initialSize: number = 10000) {
   let cachedFullChartData: (Float64Array | number[])[] | null = null
   let cachedFullChartDataVersion = -1
 
-  // 用于计算采样率的变量
-  let sampleCount = 0
-  let sampleRateUpdateTime = 0
+  // 采样率跟踪：使用较长时间窗口统计，避免突发数据批次导致采样率跳变
+  const sampleRateTracker = new SampleRateTracker()
+  let autoSampleRate = 0
+  let sampleRateOverride: number | null = null
+  let lastRateApplyTime = 0
+  let pendingRateTimer: ReturnType<typeof setTimeout> | null = null
+  let pendingRateChangeSince = 0
+
+  const applyRate = (rate: number) => {
+    autoSampleRate = rate
+    if (sampleRateOverride != null) return
+    sampleRate.value = Math.round(rate * 100) / 100
+    lastRateApplyTime = performance.now()
+    pendingRateChangeSince = 0
+  }
+
+  const applyMeasuredRate = (rate: number | null) => {
+    if (rate == null) return
+    autoSampleRate = rate
+    if (sampleRateOverride != null) return
+
+    const now = performance.now()
+    const current = sampleRate.value
+    const needsSettling = current > 0 && Math.abs(rate - current) / current > 0.02
+
+    // 常规节流：最多每 500ms 更新一次，避免频繁触发响应式渲染
+    if (!needsSettling && now - lastRateApplyTime >= 500) {
+      applyRate(rate)
+    } else if (needsSettling) {
+      // 突发数据中途可能得到偏低的瞬时速率，先观察 1s 再决定是否采用
+      if (pendingRateChangeSince === 0) {
+        pendingRateChangeSince = now
+      } else if (now - pendingRateChangeSince >= 1000) {
+        applyRate(rate)
+      }
+    } else {
+      pendingRateChangeSince = 0
+    }
+
+    // 尾随更新：等一批突发数据全部到达后再应用一次，
+    // 避免在突发中途的分批边界上得到偏低的采样率
+    if (pendingRateTimer) clearTimeout(pendingRateTimer)
+    pendingRateTimer = setTimeout(() => {
+      pendingRateTimer = null
+      const latest = sampleRateTracker.rate
+      if (latest > 0) {
+        applyRate(latest)
+      }
+    }, 100)
+  }
 
   // 节流更新响应式数据
   let pendingUpdate = false
@@ -184,21 +232,7 @@ export function useDataBuffer(initialSize: number = 10000) {
       values
     }
 
-    // 初始化更新时间（首次调用时）
-    if (sampleRateUpdateTime === 0) {
-      sampleRateUpdateTime = now
-      sampleCount = 0
-    }
-
-    // 计算采样率（优化：降低更新频率以减少卡顿）
-    sampleCount++
-
-    const elapsed = now - sampleRateUpdateTime
-    if (elapsed >= 2000) {  // 从1000ms改为2000ms
-      sampleRate.value = Math.round(sampleCount / (elapsed / 1000))
-      sampleRateUpdateTime = now
-      sampleCount = 0
-    }
+    applyMeasuredRate(sampleRateTracker.record(1, now))
 
     const previousDropped = ringBuffer.droppedCount
     ringBuffer.push(frame)
@@ -226,21 +260,7 @@ export function useDataBuffer(initialSize: number = 10000) {
       values
     }))
 
-    // 初始化更新时间（首次调用时）
-    if (sampleRateUpdateTime === 0) {
-      sampleRateUpdateTime = now
-      sampleCount = 0
-    }
-
-    // 计算采样率（优化：降低更新频率以减少卡顿）
-    sampleCount += frames.length
-
-    const elapsed = now - sampleRateUpdateTime
-    if (elapsed >= 2000) {  // 从1000ms改为2000ms
-      sampleRate.value = Math.round(sampleCount / (elapsed / 1000))
-      sampleRateUpdateTime = now
-      sampleCount = 0
-    }
+    applyMeasuredRate(sampleRateTracker.record(frames.length, now))
 
     const previousDropped = ringBuffer.droppedCount
     ringBuffer.pushBatch(newFrames)
@@ -317,60 +337,6 @@ export function useDataBuffer(initialSize: number = 10000) {
       current: rawStats.current * coefficient
     }
   }
-
-  // 获取选区统计（仅在需要时计算选区数据，应用系数）
-  const getSelectionStats = (startIndex: number, endIndex: number, channelCount: number, coefficients: number[] = []) => {
-    const frames = ringBuffer.getRange(startIndex, endIndex)
-    if (frames.length < 2) return null
-
-    const pointCount = frames.length
-
-    // 直接用采样率计算时长，不依赖 timestamp
-    // 时长（毫秒）= 点数 / 采样率 * 1000
-    const currentSampleRate = sampleRate.value > 0 ? sampleRate.value : 1
-    const duration = (pointCount / currentSampleRate) * 1000
-
-    // 频率 = 1000 / 时长（毫秒）
-    const frequency = 1000 / duration
-
-    const channels = []
-    for (let ch = 0; ch < channelCount; ch++) {
-      let min = Infinity
-      let max = -Infinity
-      let sum = 0
-      let count = 0
-      const coef = coefficients[ch] ?? 1
-
-      for (const frame of frames) {
-        if (ch < frame.values.length) {
-          const value = frame.values[ch]
-          if (isFinite(value)) {
-            min = Math.min(min, value)
-            max = Math.max(max, value)
-            sum += value
-            count++
-          }
-        }
-      }
-
-      channels.push({
-        id: ch,
-        min: (count > 0 ? min : 0) * coef,
-        max: (count > 0 ? max : 0) * coef,
-        avg: (count > 0 ? sum / count : 0) * coef
-      })
-    }
-
-    return {
-      startIndex,
-      endIndex,
-      pointCount,
-      duration,
-      frequency,
-      channels
-    }
-  }
-
 
   // 获取用于图表的数据（带智能降采样）
   const getChartData = (channelCount: number, coefficients: number[] = []) => {
@@ -582,9 +548,15 @@ export function useDataBuffer(initialSize: number = 10000) {
     data.value = []
     dataVersion.value++
     droppedCount.value = 0
-    sampleRate.value = 0
-    sampleCount = 0
-    sampleRateUpdateTime = 0
+    autoSampleRate = 0
+    sampleRate.value = sampleRateOverride ?? 0
+    sampleRateTracker.reset()
+    if (pendingRateTimer) {
+      clearTimeout(pendingRateTimer)
+      pendingRateTimer = null
+    }
+    lastRateApplyTime = 0
+    pendingRateChangeSince = 0
   }
 
   // 设置缓冲区大小
@@ -688,17 +660,67 @@ export function useDataBuffer(initialSize: number = 10000) {
     // 导入完成后，触发一次更新
     scheduleUpdate()
 
-    // 恢复采样率
+    // 恢复采样率（手动锁定优先）
     if (savedSampleRate && savedSampleRate > 0) {
-      sampleRate.value = savedSampleRate
+      autoSampleRate = savedSampleRate
+      if (sampleRateOverride == null) {
+        sampleRate.value = savedSampleRate
+      }
     }
 
     console.log('[importChannels] 导入完成，缓冲区大小:', ringBuffer.size, '采样率:', sampleRate.value)
   }
 
+  // 获取单个通道的完整数据（应用系数，用于波形分析）
+  const getChannelData = (channelIndex: number, coefficient: number = 1): Float64Array | null => {
+    const totalSize = ringBuffer.size
+    if (totalSize === 0) return null
+
+    const result = new Float64Array(totalSize)
+    let hasValidValue = false
+
+    for (let i = 0; i < totalSize; i++) {
+      const frame = ringBuffer.get(i)
+      if (frame && channelIndex < frame.values.length) {
+        const value = frame.values[channelIndex]
+        if (isFinite(value)) {
+          result[i] = value * coefficient
+          hasValidValue = true
+        } else {
+          result[i] = NaN
+        }
+      } else {
+        result[i] = NaN
+      }
+    }
+
+    return hasValidValue ? result : null
+  }
+
   // 设置采样率
   const setSampleRate = (rate: number) => {
-    sampleRate.value = rate
+    autoSampleRate = rate
+    if (sampleRateOverride == null) {
+      sampleRate.value = rate
+    }
+    sampleRateTracker.reset()
+  }
+
+  // 设置手动采样率（null = 自动估算）
+  const setSampleRateOverride = (rate: number | null) => {
+    sampleRateOverride = rate != null && isFinite(rate) && rate > 0 ? rate : null
+
+    if (pendingRateTimer) {
+      clearTimeout(pendingRateTimer)
+      pendingRateTimer = null
+    }
+    pendingRateChangeSince = 0
+
+    if (sampleRateOverride != null) {
+      sampleRate.value = sampleRateOverride
+    } else {
+      sampleRate.value = autoSampleRate > 0 ? Math.round(autoSampleRate * 100) / 100 : 0
+    }
   }
 
   // 获取数据大小
@@ -716,7 +738,7 @@ export function useDataBuffer(initialSize: number = 10000) {
     addFrame,
     addFrames,
     getChannelStats,
-    getSelectionStats,
+    getChannelData,
     getChartData,
     getChartDataInRange,
     getFullChartData,
@@ -729,6 +751,7 @@ export function useDataBuffer(initialSize: number = 10000) {
     exportData,
     importChannels,
     setSampleRate,
+    setSampleRateOverride,
     droppedCount
   }
 }

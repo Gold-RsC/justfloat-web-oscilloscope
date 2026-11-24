@@ -4,6 +4,7 @@ import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
 import type { ChannelConfig, SelectionStats } from '@/types'
 import { CHANNEL_COLORS } from '@/types'
+import { estimateDominantFrequency } from '@/utils/signalAnalysis'
 
 const props = defineProps<{
   channels: ChannelConfig[]
@@ -76,8 +77,11 @@ const calculateSelectionStats = (startIdx: number, endIdx: number): SelectionSta
 
   if (startIndex >= endIndex) return null
 
-  // 生成缓存键（包含选区范围，数据本身已应用系数）
-  const key = `${startIndex}-${endIndex}`
+  const sampleRate = props.sampleRate
+  const coefficientKey = props.channels.map(ch => ch.coefficient).join(',')
+
+  // 生成缓存键（包含选区范围、采样率与系数，避免使用过期统计）
+  const key = `${startIndex}-${endIndex}-${sampleRate}-${coefficientKey}`
 
   // 检查缓存
   if (key === cachedStatsKey) {
@@ -86,9 +90,7 @@ const calculateSelectionStats = (startIdx: number, endIdx: number): SelectionSta
 
   const pointCount = endIndex - startIndex + 1
   // 使用采样率计算时长（毫秒）：点数 / 采样率 * 1000 = 毫秒
-  const duration = pointCount / props.sampleRate * 1000
-  // 频率是时长的倒数（Hz）
-  const frequency = 1000 / duration
+  const duration = sampleRate > 0 ? (pointCount / sampleRate) * 1000 : 0
 
   // 大数据量时使用采样计算统计值，减少 CPU 占用
   const rangeSize = endIndex - startIndex + 1
@@ -96,8 +98,8 @@ const calculateSelectionStats = (startIdx: number, endIdx: number): SelectionSta
 
   const channels = props.channels.slice(0, props.channelCount).map((_, idx) => {
     const seriesIdx = idx + 1
-    const seriesData = data[seriesIdx] as number[]
-    if (!seriesData) return { id: idx, min: 0, max: 0, avg: 0 }
+    const seriesData = data[seriesIdx] as Float64Array | number[] | undefined
+    if (!seriesData) return { id: idx, min: 0, max: 0, avg: 0, frequency: null }
 
     let sum = 0
     let min = Infinity
@@ -115,11 +117,21 @@ const calculateSelectionStats = (startIdx: number, endIdx: number): SelectionSta
       }
     }
 
+    // 对选区内的数据估算主频（最多使用最近的 8192 点，避免拖拽时卡顿）
+    let frequency: number | null = null
+    if (sampleRate > 0 && rangeSize >= 16) {
+      const segment = seriesData instanceof Float64Array
+        ? seriesData.subarray(startIndex, endIndex + 1)
+        : seriesData.slice(startIndex, endIndex + 1)
+      frequency = estimateDominantFrequency(segment, sampleRate)
+    }
+
     return {
       id: idx,
       min: count > 0 ? min : 0,
       max: count > 0 ? max : 0,
-      avg: count > 0 ? sum / count : 0
+      avg: count > 0 ? sum / count : 0,
+      frequency
     }
   }).filter(ch => ch !== undefined) as SelectionStats['channels']
 
@@ -128,7 +140,7 @@ const calculateSelectionStats = (startIdx: number, endIdx: number): SelectionSta
     endIndex,
     pointCount,
     duration,
-    frequency,
+    sampleRate,
     channels
   }
 
@@ -908,6 +920,15 @@ watch(() => props.isDark, async () => {
 watch(() => props.channels.map(ch => ch.coefficient), () => {
   if (isZoomed.value && zoomRange.value) {
     // 重新计算选区统计
+    const stats = calculateSelectionStats(zoomRange.value.start, zoomRange.value.end)
+    selectionStats.value = stats
+    emit('selection-change', stats)
+  }
+})
+
+// 采样率稳定 / 更新后重新计算选区统计，保证主频与时长使用最新采样率
+watch(() => props.sampleRate, () => {
+  if (isZoomed.value && zoomRange.value) {
     const stats = calculateSelectionStats(zoomRange.value.start, zoomRange.value.end)
     selectionStats.value = stats
     emit('selection-change', stats)

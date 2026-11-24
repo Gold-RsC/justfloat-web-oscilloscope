@@ -5,6 +5,7 @@ import SidePanel from './components/SidePanel.vue'
 import OscilloscopeChart from './components/OscilloscopeChart.vue'
 import SelectionStatsPanel from './components/SelectionStatsPanel.vue'
 import StatusBar from './components/StatusBar.vue'
+import ChannelAnalysisModal from './components/ChannelAnalysisModal.vue'
 import { useSerial } from './composables/useSerial'
 import { useWebSocket } from './composables/useWebSocket'
 import { useBluetooth } from './composables/useBluetooth'
@@ -12,11 +13,11 @@ import { useProtocolParser } from './composables/useProtocolParser'
 import { useDataBuffer } from './composables/useDataBuffer'
 import { useChannelConfig } from './composables/useChannelConfig'
 import { useStorage } from './composables/useStorage'
-import type { AppConfig, ExportData, ProtocolType, ConnectionType } from './types'
-import { downloadJson, readJsonFile } from '@/utils/helpers'
+import type { AppConfig, ExportData, ProtocolType, ConnectionType, ExportSettings, ChannelConfig } from './types'
+import { buildCsv, buildExportFileName, downloadJson, downloadText, readJsonFile } from '@/utils/helpers'
 
 // 初始化存储
-const { loadConfig, saveConfig } = useStorage()
+const { loadConfig, saveConfig, loadExportSettings, saveExportSettings } = useStorage()
 const savedConfig = loadConfig()
 
 // 初始化各模块
@@ -26,6 +27,14 @@ const bluetooth = useBluetooth()
 const parser = useProtocolParser()
 const buffer = useDataBuffer(savedConfig.bufferSize)
 const channelConfig = useChannelConfig()
+
+// 手动采样率（null = 自动估算）
+const sampleRateOverride = ref<number | null>(savedConfig.sampleRateOverride ?? null)
+buffer.setSampleRateOverride(sampleRateOverride.value)
+
+watch(sampleRateOverride, (rate) => {
+  buffer.setSampleRateOverride(rate)
+})
 
 // 加载通道配置
 if (savedConfig.channels.length > 0) {
@@ -65,6 +74,15 @@ const wsUrl = ref(savedConfig.wsUrl || 'ws://localhost:8080')
 const btServiceUUID = ref(savedConfig.btServiceUUID || 'ffe0')
 const btCharacteristicUUID = ref(savedConfig.btCharacteristicUUID || 'ffe1')
 const isFirstSerialConnection = ref(savedConfig.isFirstSerialConnection ?? true)
+
+// 数据采集运行状态（停止后保留当前波形，开始时会清空数据）
+const isRunning = ref(true)
+
+// 导出设置（更改后立即持久化）
+const exportSettings = ref<ExportSettings>(loadExportSettings())
+watch(exportSettings, (settings) => {
+  saveExportSettings(settings)
+}, { deep: true })
 
 // 当前连接模块（根据连接类型切换）
 const currentConnection = computed(() => {
@@ -132,6 +150,7 @@ const handleConnect = async (forceSelect: boolean = false) => {
 
 // 数据回调
 const handleData = (data: Uint8Array) => {
+  if (!isRunning.value) return
   parser.processData(data)
 }
 
@@ -146,6 +165,7 @@ bluetooth.onData(handleData)
 
 // 协议帧批量回调（高性能）
 parser.onFramesBatch((frames) => {
+  if (!isRunning.value) return
   buffer.addFrames(frames)
   // 根据缓冲区使用率动态调整批量策略
   const usage = buffer.totalPoints.value / buffer.bufferSize.value
@@ -167,7 +187,7 @@ watch(() => buffer.totalPoints.value, (totalPoints) => {
 
 // 保存配置（使用防抖避免频繁写入 localStorage）
 let saveConfigTimer: ReturnType<typeof setTimeout> | null = null
-watch([() => baudRate.value, () => bufferSize.value, () => protocol.value, () => connectionType.value, () => wsUrl.value, () => btServiceUUID.value, () => btCharacteristicUUID.value, () => channelConfig.channels.value, () => isDark.value, () => isFirstSerialConnection.value], () => {
+watch([() => baudRate.value, () => bufferSize.value, () => protocol.value, () => connectionType.value, () => wsUrl.value, () => btServiceUUID.value, () => btCharacteristicUUID.value, () => channelConfig.channels.value, () => sampleRateOverride.value, () => isDark.value, () => isFirstSerialConnection.value], () => {
   // 清除之前的定时器
   if (saveConfigTimer) {
     clearTimeout(saveConfigTimer)
@@ -184,6 +204,7 @@ watch([() => baudRate.value, () => bufferSize.value, () => protocol.value, () =>
       btServiceUUID: btServiceUUID.value,
       btCharacteristicUUID: btCharacteristicUUID.value,
       channels: channelConfig.channels.value,
+      sampleRateOverride: sampleRateOverride.value,
       isDark: isDark.value,
       isFirstSerialConnection: isFirstSerialConnection.value
     }
@@ -201,12 +222,50 @@ watch(bufferSize, (size) => {
   buffer.setBufferSize(size)
 })
 
-// 清除数据
-const handleClear = () => {
+// 开始 / 停止数据采集
+const handleToggleRunning = () => {
+  if (isRunning.value) {
+    isRunning.value = false
+    return
+  }
+
+  // 开始时清除旧数据，保证新一轮采集从零开始
   buffer.clear()
   parser.fullReset()
   cursorValues.value = null
   cursorIndex.value = null
+  selectionStats.value = null
+  isRunning.value = true
+}
+
+// 波形分析快照（打开分析弹窗时冻结当前通道数据）
+interface AnalysisSnapshot {
+  channel: ChannelConfig
+  data: Float64Array
+  sampleRate: number
+}
+
+const analysisSnapshot = ref<AnalysisSnapshot | null>(null)
+
+const handleAnalyzeChannel = (channelId: number) => {
+  const channel = channelConfig.channels.value.find(ch => ch.id === channelId)
+  if (!channel) return
+
+  const data = buffer.getChannelData(channelId, channel.coefficient)
+  if (!data) {
+    alert('该通道暂无有效数据')
+    return
+  }
+  if (buffer.sampleRate.value <= 0) {
+    alert('采样率未知，暂时无法进行波形分析')
+    return
+  }
+
+  analysisSnapshot.value = {
+    channel: { ...channel },
+    data,
+    sampleRate: buffer.sampleRate.value
+  }
 }
 
 // 光标值变化
@@ -217,8 +276,17 @@ const handleCursorValues = (values: number[] | null, index: number | null) => {
 
 // 导出数据
 const handleExport = () => {
-  const exportData: ExportData = {
-    config: {
+  const rawChannels = buffer.exportData()
+  if (rawChannels.length === 0) {
+    alert('暂无数据可导出')
+    return
+  }
+
+  const settings = exportSettings.value
+  const filename = buildExportFileName(settings.fileName, settings.format)
+
+  if (settings.format === 'json') {
+    const config: AppConfig = {
       baudRate: baudRate.value,
       bufferSize: bufferSize.value,
       protocol: protocol.value,
@@ -227,14 +295,40 @@ const handleExport = () => {
       btServiceUUID: btServiceUUID.value,
       btCharacteristicUUID: btCharacteristicUUID.value,
       channels: channelConfig.channels.value,
+      sampleRateOverride: sampleRateOverride.value,
       isFirstSerialConnection: isFirstSerialConnection.value
-    },
-    channels: buffer.exportData(),
-    sampleRate: buffer.sampleRate.value,
-    exportTime: new Date().toISOString()
+    }
+
+    const exportData: ExportData = {
+      ...(settings.includeConfig ? { config } : {}),
+      channels: rawChannels,
+      sampleRate: buffer.sampleRate.value,
+      exportTime: new Date().toISOString()
+    }
+    downloadJson(exportData, filename)
+    return
   }
-  const filename = `oscilloscope-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`
-  downloadJson(exportData, filename)
+
+  // CSV：应用通道系数，使输出与图表显示一致
+  const coefficients = channelConfig.getCoefficients()
+  const columns = rawChannels.map((column, index) => {
+    const coefficient = coefficients[index] ?? 1
+    return column.map(value => value * coefficient)
+  })
+  const headers = rawChannels.map((_, index) => {
+    const channel = channelConfig.channels.value[index]
+    const name = channel?.name || `通道 ${index + 1}`
+    return channel?.unit ? `${name} (${channel.unit})` : name
+  })
+  const csv = buildCsv(
+    headers,
+    columns,
+    buffer.sampleRate.value,
+    settings.includeTimeColumn,
+    settings.precision
+  )
+  // 加 BOM，避免 Excel 打开中文表头乱码
+  downloadText('﻿' + csv, filename, 'text/csv;charset=utf-8')
 }
 
 // 导入数据
@@ -250,6 +344,10 @@ const handleImport = async () => {
       console.log('开始导入文件:', file.name)
       const data = await readJsonFile<ExportData>(file)
       console.log('解析后的数据:', data)
+
+      // 导入文件自带采样率，切换到自动模式以使用文件中的数值
+      sampleRateOverride.value = null
+      buffer.setSampleRateOverride(null)
 
       if (data.config) {
         console.log('导入配置:', data.config)
@@ -311,13 +409,17 @@ onUnmounted(() => {
       :bt-characteristic-u-u-i-d="btCharacteristicUUID"
       :baud-rate="baudRate"
       :is-dark="isDark"
+      :is-running="isRunning"
+      :export-settings="exportSettings"
+      :has-data="buffer.totalPoints.value > 0"
       :has-connected-before="!isFirstSerialConnection"
       @connect="handleConnect()"
       @connect:force-select="handleConnect(true)"
-      @clear="handleClear"
+      @toggle-running="handleToggleRunning"
       @export="handleExport"
       @import="handleImport"
       @toggle-theme="toggleTheme"
+      @update:export-settings="exportSettings = $event"
       @update:connection-type="connectionType = $event"
       @update:ws-url="wsUrl = $event"
       @update:bt-service-u-u-i-d="btServiceUUID = $event"
@@ -335,10 +437,14 @@ onUnmounted(() => {
         :channel-count="parser.channelCount.value"
         :cursor-values="cursorValues"
         :cursor-index="cursorIndex"
+        :sample-rate-override="sampleRateOverride"
+        :effective-sample-rate="buffer.sampleRate.value"
         :get-channel-stats="(id: number) => buffer.getChannelStats(id, channelConfig.channels.value[id]?.coefficient ?? 1)"
         :is-dark="isDark"
         @update-channel="channelConfig.updateChannel"
         @toggle-visibility="channelConfig.toggleVisibility"
+        @analyze-channel="handleAnalyzeChannel"
+        @update:sample-rate-override="sampleRateOverride = $event"
       />
 
       <!-- 图表区域 -->
@@ -380,6 +486,16 @@ onUnmounted(() => {
       :channel-count="parser.channelCount.value"
       :buffer-size="bufferSize"
       :is-dark="isDark"
+    />
+
+    <!-- 波形分析弹窗 -->
+    <ChannelAnalysisModal
+      v-if="analysisSnapshot"
+      :channel="analysisSnapshot.channel"
+      :data="analysisSnapshot.data"
+      :sample-rate="analysisSnapshot.sampleRate"
+      :is-dark="isDark"
+      @close="analysisSnapshot = null"
     />
   </div>
 </template>
